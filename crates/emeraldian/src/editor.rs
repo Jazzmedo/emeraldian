@@ -28,6 +28,22 @@ fn char_width(ch: char, tab_width: usize, column: usize) -> usize {
     }
 }
 
+/// Which of vim's three kinds of character a char is, for the word motions.
+///
+/// `w` steps over a run of one kind at a time, which is why `foo.bar` is three
+/// words and not one: the letters and the dot are different kinds. A WORD (`W`)
+/// makes no such distinction and stops only at blanks.
+#[must_use]
+fn class(ch: char, big: bool) -> u8 {
+    if ch.is_whitespace() {
+        0
+    } else if big || ch.is_alphanumeric() || ch == '_' {
+        2
+    } else {
+        1
+    }
+}
+
 /// A position in the buffer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default)]
 pub struct Cursor {
@@ -308,6 +324,8 @@ pub struct Editor {
     /// where reaching the end of a long line is the whole point.
     pub hscroll: usize,
     modified: bool,
+    /// Bumped on every change, so a caller can tell whether one happened.
+    revision: u64,
     undo: Vec<Snapshot>,
     redo: Vec<Snapshot>,
     last_edit: Option<EditKind>,
@@ -330,6 +348,7 @@ impl Editor {
             scroll: 0,
             hscroll: 0,
             modified: false,
+            revision: 0,
             undo: Vec::new(),
             redo: Vec::new(),
             last_edit: None,
@@ -372,6 +391,22 @@ impl Editor {
 
     pub fn mark_saved(&mut self) {
         self.modified = false;
+    }
+
+    /// Records that the text changed.
+    ///
+    /// `modified` answers "is there unsaved work", which stays true once set;
+    /// `revision` answers "did *that* keystroke change anything", which needs a
+    /// number that moves every time. Vim's `.` uses the second to tell a
+    /// command worth repeating from a motion that merely moved the cursor.
+    fn touch(&mut self) {
+        self.modified = true;
+        self.revision = self.revision.wrapping_add(1);
+    }
+
+    #[must_use]
+    pub fn revision(&self) -> u64 {
+        self.revision
     }
 
     /// The buffer as text, always newline-terminated.
@@ -542,6 +577,125 @@ impl Editor {
         }
     }
 
+    /// Moves `delta` **source lines**, which is what vim's `j` and `k` do.
+    ///
+    /// Distinct from [`Editor::move_row`], which follows the text as it was
+    /// wrapped: on a paragraph filling four rows, this crosses it in one press
+    /// and `move_row` takes four. Vim binds both — `j` here, `gj` there — so
+    /// the two coexist rather than one replacing the other.
+    ///
+    /// The aimed-for column is kept in display columns, like `move_row`, so
+    /// travelling through a short line and back out lands where it started.
+    /// `usize::MAX` means "the end of whatever line you land on", which is how
+    /// `$` then `j` stays at the end — vim's `curswant`.
+    pub fn move_line(&mut self, delta: isize, extend: bool) {
+        let want = self
+            .desired_col
+            .unwrap_or_else(|| u16::try_from(self.display_col(self.cursor)).unwrap_or(u16::MAX));
+        self.prepare_move(extend);
+
+        let last = self.lines.len().saturating_sub(1) as isize;
+        self.cursor.line = (self.cursor.line as isize + delta).clamp(0, last) as usize;
+        self.cursor.col = self.col_at_display(self.cursor.line, want);
+        self.desired_col = Some(want);
+    }
+
+    /// Sticks the cursor to the end of the line, so a following `j` stays there.
+    pub fn move_line_end_sticky(&mut self, extend: bool) {
+        self.move_line_end(extend);
+        self.desired_col = Some(u16::MAX);
+    }
+
+    /// `^`: the first character that isn't blank.
+    pub fn move_first_nonblank(&mut self, extend: bool) {
+        self.prepare_move(extend);
+        self.cursor.col = self.lines[self.cursor.line]
+            .chars()
+            .take_while(|c| *c == ' ' || *c == '\t')
+            .count()
+            .min(self.line_len(self.cursor.line));
+    }
+
+    /// Display column a cursor sits at, ignoring wrapping.
+    fn display_col(&self, cursor: Cursor) -> usize {
+        let mut column = 0;
+        if let Some(text) = self.lines.get(cursor.line) {
+            for ch in text.chars().take(cursor.col) {
+                column += char_width(ch, self.tab_width, column);
+            }
+        }
+        column
+    }
+
+    /// The character offset nearest a display column on `line`.
+    fn col_at_display(&self, line: usize, want: u16) -> usize {
+        let len = self.line_len(line);
+        if want == u16::MAX {
+            return len;
+        }
+        let target = usize::from(want);
+        let mut column = 0;
+        let mut col = 0;
+        if let Some(text) = self.lines.get(line) {
+            for ch in text.chars() {
+                let width = char_width(ch, self.tab_width, column);
+                if column + width > target {
+                    break;
+                }
+                column += width;
+                col += 1;
+            }
+        }
+        col.min(len)
+    }
+
+    /// Jumps to a position a motion worked out, clamped into the buffer.
+    ///
+    /// Unlike [`Editor::goto`] this keeps the selection, so the same call
+    /// serves Normal mode and a visual-mode motion that is extending one.
+    pub fn set_cursor(&mut self, at: Cursor) {
+        let line = at.line.min(self.lines.len().saturating_sub(1));
+        self.cursor = Cursor {
+            line,
+            col: at.col.min(self.line_len(line)),
+        };
+        self.desired_col = None;
+    }
+
+    /// The end of the word `from` sits in, without stepping into the next one.
+    ///
+    /// `ge` needs this: it walks back a word and then wants that word's end,
+    /// where [`Editor::word_end`] would skip on to the following one.
+    #[must_use]
+    pub fn word_end_from(&self, from: Cursor, big: bool) -> Cursor {
+        let mut at = from;
+        let kind = self.char_at(at).map_or(0, |ch| class(ch, big));
+        while let Some(next) = self.next_pos(at) {
+            if self.char_at(next).map_or(0, |ch| class(ch, big)) != kind {
+                break;
+            }
+            at = next;
+        }
+        at
+    }
+
+    /// Places the cursor without disturbing the selection, for visual mode.
+    pub fn goto_extend(&mut self, line: usize, col: usize) {
+        let anchor = self.selection_anchor;
+        self.goto(line, col);
+        self.selection_anchor = anchor;
+    }
+
+    /// Pulls the cursor back onto a character.
+    ///
+    /// Vim's Normal mode cursor sits *on* a character rather than between two,
+    /// so it can never rest one past the end of a line the way an insertion
+    /// caret does. Called whenever a command finishes in Normal mode.
+    pub fn clamp_normal(&mut self) {
+        let len = self.line_len(self.cursor.line);
+        self.cursor.col = self.cursor.col.min(len.saturating_sub(1));
+    }
+
     pub fn move_document_start(&mut self, extend: bool) {
         self.prepare_move(extend);
         self.cursor = Cursor::default();
@@ -626,7 +780,7 @@ impl Editor {
             self.lines[self.cursor.line] = String::new();
             self.cursor.col = 0;
             self.desired_col = None;
-            self.modified = true;
+            self.touch();
             return;
         }
 
@@ -697,7 +851,7 @@ impl Editor {
         };
         self.desired_col = None;
         self.selection_anchor = None;
-        self.modified = true;
+        self.touch();
     }
 
     pub fn backspace(&mut self) {
@@ -735,7 +889,7 @@ impl Editor {
             self.lines[self.cursor.line].push_str(&current);
         }
         self.desired_col = None;
-        self.modified = true;
+        self.touch();
     }
 
     pub fn delete_forward(&mut self) {
@@ -761,7 +915,7 @@ impl Editor {
             let next = self.lines.remove(self.cursor.line + 1);
             self.lines[self.cursor.line].push_str(&next);
         }
-        self.modified = true;
+        self.touch();
     }
 
     /// Deletes the current line, or every line the selection touches.
@@ -780,7 +934,183 @@ impl Editor {
         self.cursor.line = first.min(self.lines.len() - 1);
         self.cursor.col = 0;
         self.selection_anchor = None;
-        self.modified = true;
+        self.touch();
+    }
+
+    /// `x`: removes characters at the cursor and hands them back.
+    ///
+    /// Stops at the end of the line rather than pulling the next one up, which
+    /// is what vim does and what keeps `5x` on a three-character line from
+    /// eating the line break.
+    #[must_use]
+    pub fn take_chars(&mut self, count: usize) -> String {
+        let len = self.line_len(self.cursor.line);
+        if self.cursor.col >= len {
+            return String::new();
+        }
+        self.push_undo(EditKind::Delete);
+
+        let chars: Vec<char> = self.lines[self.cursor.line].chars().collect();
+        let end = (self.cursor.col + count.max(1)).min(len);
+        let taken: String = chars[self.cursor.col..end].iter().collect();
+        let kept: String = chars[..self.cursor.col]
+            .iter()
+            .chain(chars[end..].iter())
+            .collect();
+        self.lines[self.cursor.line] = kept;
+        self.desired_col = None;
+        self.touch();
+        taken
+    }
+
+    /// `r`: overwrites the characters under the cursor, staying in place.
+    ///
+    /// Refuses when the count runs past the end of the line, exactly as vim
+    /// does — a partial replace would be worse than none.
+    pub fn replace_char(&mut self, ch: char, count: usize) {
+        let len = self.line_len(self.cursor.line);
+        let count = count.max(1);
+        if self.cursor.col + count > len {
+            return;
+        }
+        self.push_undo(EditKind::Structural);
+
+        let chars: Vec<char> = self.lines[self.cursor.line].chars().collect();
+        let mut line: String = chars[..self.cursor.col].iter().collect();
+        for _ in 0..count {
+            line.push(ch);
+        }
+        line.extend(chars[self.cursor.col + count..].iter());
+        self.lines[self.cursor.line] = line;
+        // Vim leaves the cursor on the last character replaced.
+        self.cursor.col += count - 1;
+        self.desired_col = None;
+        self.touch();
+    }
+
+    /// Characters on a line, for callers outside this module.
+    #[must_use]
+    pub fn line_len_at(&self, line: usize) -> usize {
+        self.line_len(line)
+    }
+
+    /// `dd`: removes whole lines and hands them back to be yanked.
+    ///
+    /// Distinct from [`Editor::delete_line`], which discards them. Vim's delete
+    /// always fills the register, so the text has to come back out.
+    #[must_use]
+    pub fn take_lines(&mut self, first: usize, count: usize) -> String {
+        self.push_undo(EditKind::Structural);
+        let first = first.min(self.lines.len().saturating_sub(1));
+        let last = (first + count.max(1) - 1).min(self.lines.len() - 1);
+
+        let taken: Vec<String> = self.lines.drain(first..=last).collect();
+        if self.lines.is_empty() {
+            self.lines.push(String::new());
+        }
+        self.cursor.line = first.min(self.lines.len() - 1);
+        self.cursor.col = 0;
+        self.desired_col = None;
+        self.selection_anchor = None;
+        self.touch();
+
+        let mut text = taken.join("\n");
+        text.push('\n');
+        text
+    }
+
+    /// `yy`: the lines themselves, left where they are.
+    #[must_use]
+    pub fn copy_lines(&self, first: usize, count: usize) -> String {
+        let first = first.min(self.lines.len().saturating_sub(1));
+        let last = (first + count.max(1) - 1).min(self.lines.len() - 1);
+        let mut text = self.lines[first..=last].join("\n");
+        text.push('\n');
+        text
+    }
+
+    /// `p` and `P`.
+    ///
+    /// Linewise text goes on its own line below or above and takes the cursor
+    /// with it; charwise text goes after or before the cursor, which is the
+    /// distinction that makes `yy`/`p` duplicate a line rather than splice it
+    /// into the middle of one.
+    pub fn put(&mut self, text: &str, linewise: bool, after: bool) {
+        if text.is_empty() {
+            return;
+        }
+        self.push_undo(EditKind::Structural);
+
+        if !linewise {
+            if after && self.cursor.col < self.line_len(self.cursor.line) {
+                self.cursor.col += 1;
+            }
+            let start = self.cursor;
+            for (i, part) in text.split('\n').enumerate() {
+                if i > 0 {
+                    self.split_line();
+                }
+                if !part.is_empty() {
+                    self.insert_into_line(part);
+                }
+            }
+            // Vim leaves the cursor on the last character pasted, not past it.
+            if start.line == self.cursor.line && self.cursor.col > start.col {
+                self.cursor.col -= 1;
+            }
+            return;
+        }
+
+        let mut lines: Vec<String> = text.split('\n').map(str::to_string).collect();
+        // A linewise register always ends in a newline, so the split leaves an
+        // empty tail that is not a line.
+        if lines.last().is_some_and(String::is_empty) {
+            lines.pop();
+        }
+        if lines.is_empty() {
+            return;
+        }
+
+        let at = if after {
+            self.cursor.line + 1
+        } else {
+            self.cursor.line
+        };
+        let at = at.min(self.lines.len());
+        for (offset, line) in lines.drain(..).enumerate() {
+            self.lines.insert(at + offset, line);
+        }
+        self.cursor.line = at;
+        self.cursor.col = 0;
+        self.desired_col = None;
+        self.selection_anchor = None;
+        self.touch();
+    }
+
+    /// `o` and `O`: a blank line below or above, cursor on it.
+    ///
+    /// Carries indentation and continues a list, exactly as `Enter` does — the
+    /// two keys mean the same thing and would be baffling if they disagreed.
+    pub fn open_line(&mut self, above: bool) {
+        if above {
+            self.push_undo(EditKind::Structural);
+            self.lines.insert(self.cursor.line, String::new());
+            self.cursor.col = 0;
+            self.desired_col = None;
+            self.touch();
+            // Indentation comes from the line that was pushed down, since
+            // there may be nothing above to copy.
+            let indent: String = self.lines[self.cursor.line + 1]
+                .chars()
+                .take_while(|c| *c == ' ' || *c == '\t')
+                .collect();
+            if !indent.is_empty() {
+                self.insert_into_line(&indent);
+            }
+            return;
+        }
+        self.move_line_end(false);
+        self.newline();
     }
 
     pub fn delete_selection(&mut self) {
@@ -798,7 +1128,7 @@ impl Editor {
             // With no selection, insert the pair and place the cursor inside.
             self.insert_into_line(&format!("{marker}{marker}"));
             self.cursor.col -= marker.chars().count();
-            self.modified = true;
+            self.touch();
             return;
         };
 
@@ -819,7 +1149,7 @@ impl Editor {
             }
             self.insert_into_line(part);
         }
-        self.modified = true;
+        self.touch();
     }
 
     fn delete_selection_inner(&mut self) {
@@ -840,7 +1170,7 @@ impl Editor {
         self.cursor = start;
         self.desired_col = None;
         self.selection_anchor = None;
-        self.modified = true;
+        self.touch();
     }
 
     fn insert_into_line(&mut self, text: &str) {
@@ -852,7 +1182,7 @@ impl Editor {
         self.lines[self.cursor.line] = line;
         self.cursor.col = col + text.chars().count();
         self.desired_col = None;
-        self.modified = true;
+        self.touch();
     }
 
     fn split_line(&mut self) {
@@ -865,7 +1195,7 @@ impl Editor {
         self.cursor.line += 1;
         self.cursor.col = 0;
         self.desired_col = None;
-        self.modified = true;
+        self.touch();
     }
 
     // ---- undo ------------------------------------------------------------
@@ -908,7 +1238,7 @@ impl Editor {
         self.cursor = snapshot.cursor;
         self.selection_anchor = None;
         self.last_edit = None;
-        self.modified = true;
+        self.touch();
         true
     }
 
@@ -924,7 +1254,578 @@ impl Editor {
         self.cursor = snapshot.cursor;
         self.selection_anchor = None;
         self.last_edit = None;
-        self.modified = true;
+        self.touch();
+        true
+    }
+
+    // ---- vim motions -----------------------------------------------------
+
+    /// The character at a position, with `\n` standing for the end of a line.
+    ///
+    /// Treating the line break as a character is what lets the word motions be
+    /// written once and still cross lines: a newline is blank, so `w` at the end
+    /// of a line walks onto the next one without a special case.
+    #[must_use]
+    fn char_at(&self, at: Cursor) -> Option<char> {
+        let line = self.lines.get(at.line)?;
+        match line.chars().nth(at.col) {
+            Some(ch) => Some(ch),
+            None if at.line + 1 < self.lines.len() => Some('\n'),
+            None => None,
+        }
+    }
+
+    /// The next position, walking off the end of a line onto the next.
+    fn next_pos(&self, at: Cursor) -> Option<Cursor> {
+        if at.col < self.line_len(at.line) {
+            return Some(Cursor {
+                line: at.line,
+                col: at.col + 1,
+            });
+        }
+        (at.line + 1 < self.lines.len()).then(|| Cursor {
+            line: at.line + 1,
+            col: 0,
+        })
+    }
+
+    /// The previous position, walking back onto the end of the line above.
+    fn prev_pos(&self, at: Cursor) -> Option<Cursor> {
+        if at.col > 0 {
+            return Some(Cursor {
+                line: at.line,
+                col: at.col - 1,
+            });
+        }
+        at.line.checked_sub(1).map(|line| Cursor {
+            line,
+            col: self.line_len(line),
+        })
+    }
+
+    /// `w` and `W`: the start of the next word.
+    #[must_use]
+    pub fn word_forward(&self, from: Cursor, count: usize, big: bool) -> Cursor {
+        let mut at = from;
+        for _ in 0..count.max(1) {
+            // Step off whatever the cursor is on, then over anything of the
+            // same kind, then over the blanks that follow it.
+            let start = self.char_at(at).map_or(0, |ch| class(ch, big));
+            while let Some(next) = self.next_pos(at) {
+                if self.char_at(at).map_or(0, |ch| class(ch, big)) != start {
+                    break;
+                }
+                at = next;
+            }
+            while let Some(next) = self.next_pos(at) {
+                if self.char_at(at).is_some_and(|ch| class(ch, big) != 0) {
+                    break;
+                }
+                at = next;
+            }
+        }
+        at
+    }
+
+    /// `b` and `B`: the start of the word before.
+    #[must_use]
+    pub fn word_back(&self, from: Cursor, count: usize, big: bool) -> Cursor {
+        let mut at = from;
+        for _ in 0..count.max(1) {
+            let Some(prev) = self.prev_pos(at) else { break };
+            at = prev;
+            // Back over the blanks, then to the front of the word landed in.
+            while self.char_at(at).is_some_and(|ch| class(ch, big) == 0) {
+                match self.prev_pos(at) {
+                    Some(prev) => at = prev,
+                    None => break,
+                }
+            }
+            let kind = self.char_at(at).map_or(0, |ch| class(ch, big));
+            while let Some(prev) = self.prev_pos(at) {
+                if self.char_at(prev).map_or(0, |ch| class(ch, big)) != kind {
+                    break;
+                }
+                at = prev;
+            }
+        }
+        at
+    }
+
+    /// `e` and `E`: the last character of the current or next word.
+    #[must_use]
+    pub fn word_end(&self, from: Cursor, count: usize, big: bool) -> Cursor {
+        let mut at = from;
+        for _ in 0..count.max(1) {
+            let Some(next) = self.next_pos(at) else { break };
+            at = next;
+            while self.char_at(at).is_some_and(|ch| class(ch, big) == 0) {
+                match self.next_pos(at) {
+                    Some(next) => at = next,
+                    None => break,
+                }
+            }
+            let kind = self.char_at(at).map_or(0, |ch| class(ch, big));
+            while let Some(next) = self.next_pos(at) {
+                if self.char_at(next).map_or(0, |ch| class(ch, big)) != kind {
+                    break;
+                }
+                at = next;
+            }
+        }
+        at
+    }
+
+    /// `{` and `}`: the blank line before or after this block of text.
+    #[must_use]
+    pub fn paragraph(&self, from: Cursor, forward: bool, count: usize) -> Cursor {
+        let blank = |line: usize| {
+            self.lines
+                .get(line)
+                .is_some_and(|text| text.trim().is_empty())
+        };
+        let mut line = from.line;
+        for _ in 0..count.max(1) {
+            if forward {
+                line += 1;
+                while line < self.lines.len() && blank(line) {
+                    line += 1;
+                }
+                while line < self.lines.len() && !blank(line) {
+                    line += 1;
+                }
+                line = line.min(self.lines.len() - 1);
+            } else {
+                line = line.saturating_sub(1);
+                while line > 0 && blank(line) {
+                    line -= 1;
+                }
+                while line > 0 && !blank(line) {
+                    line -= 1;
+                }
+            }
+        }
+        Cursor { line, col: 0 }
+    }
+
+    /// `f`, `F`, `t` and `T`: a character on this line.
+    ///
+    /// Stays on one line, as vim does — that is the whole point of it as a
+    /// motion you can aim by eye.
+    #[must_use]
+    pub fn find_in_line(
+        &self,
+        from: Cursor,
+        target: char,
+        forward: bool,
+        till: bool,
+        count: usize,
+    ) -> Option<Cursor> {
+        let chars: Vec<char> = self.lines.get(from.line)?.chars().collect();
+        let mut col = from.col;
+        for _ in 0..count.max(1) {
+            if forward {
+                col = (col + 1..chars.len()).find(|&i| chars[i] == target)?;
+            } else {
+                col = (0..col).rev().find(|&i| chars[i] == target)?;
+            }
+        }
+        // `t` stops one short of the target; `T` stops one after it.
+        let col = if till {
+            if forward {
+                col.checked_sub(1)?
+            } else {
+                col + 1
+            }
+        } else {
+            col
+        };
+        Some(Cursor {
+            line: from.line,
+            col,
+        })
+    }
+
+    /// The next occurrence of `pattern`, wrapping round the ends of the note.
+    ///
+    /// A plain substring rather than a regular expression: notes are prose, the
+    /// thing being looked for is almost always a word, and a half-supported
+    /// regex dialect would be worse than an honest literal one. Case is
+    /// ignored unless the pattern has a capital in it, which is vim's
+    /// `smartcase` and what people expect without knowing its name.
+    #[must_use]
+    pub fn find_next(&self, from: Cursor, pattern: &str, forward: bool) -> Option<Cursor> {
+        if pattern.is_empty() {
+            return None;
+        }
+        let sensitive = pattern.chars().any(char::is_uppercase);
+        let needle = if sensitive {
+            pattern.to_string()
+        } else {
+            pattern.to_lowercase()
+        };
+
+        let hay = |line: usize| {
+            let text = &self.lines[line];
+            if sensitive {
+                text.clone()
+            } else {
+                text.to_lowercase()
+            }
+        };
+        // Byte offsets from `match_indices` have to come back as characters, or
+        // a match after an accent lands the cursor mid-glyph.
+        let as_chars = |line: usize, byte: usize| self.lines[line][..byte].chars().count();
+
+        let count = self.lines.len();
+        for step in 0..=count {
+            let line = if forward {
+                (from.line + step) % count
+            } else {
+                (from.line + count - step % count) % count
+            };
+            let text = hay(line);
+
+            let found = if forward {
+                let after = if step == 0 { from.col + 1 } else { 0 };
+                let start = text
+                    .char_indices()
+                    .nth(after)
+                    .map_or(text.len(), |(byte, _)| byte);
+                text.get(start..)
+                    .and_then(|rest| rest.find(&needle).map(|at| at + start))
+            } else {
+                let before = if step == 0 {
+                    text.char_indices()
+                        .nth(from.col)
+                        .map_or(text.len(), |(byte, _)| byte)
+                } else {
+                    text.len()
+                };
+                text.get(..before).and_then(|head| head.rfind(&needle))
+            };
+
+            if let Some(byte) = found {
+                return Some(Cursor {
+                    line,
+                    col: as_chars(line, byte),
+                });
+            }
+        }
+        None
+    }
+
+    /// Every match of `pattern` on one line, as character ranges.
+    ///
+    /// For the renderer: showing only the match jumped to leaves the other
+    /// hits invisible, which is most of what a search is for.
+    #[must_use]
+    pub fn matches_on(&self, line: usize, pattern: &str) -> Vec<(usize, usize)> {
+        if pattern.is_empty() {
+            return Vec::new();
+        }
+        let Some(text) = self.lines.get(line) else {
+            return Vec::new();
+        };
+        let sensitive = pattern.chars().any(char::is_uppercase);
+        let (hay, needle) = if sensitive {
+            (text.clone(), pattern.to_string())
+        } else {
+            (text.to_lowercase(), pattern.to_lowercase())
+        };
+        let width = needle.chars().count();
+
+        hay.match_indices(&needle)
+            .map(|(byte, _)| {
+                let start = text[..byte].chars().count();
+                (start, start + width)
+            })
+            .collect()
+    }
+
+    // ---- text objects ----------------------------------------------------
+
+    /// `iw` and `aw`, as an inclusive character range.
+    #[must_use]
+    pub fn word_object(&self, at: Cursor, around: bool, big: bool) -> Option<(Cursor, Cursor)> {
+        let chars: Vec<char> = self.lines.get(at.line)?.chars().collect();
+        if chars.is_empty() {
+            return None;
+        }
+        let col = at.col.min(chars.len() - 1);
+        let kind = class(chars[col], big);
+
+        let mut start = col;
+        while start > 0 && class(chars[start - 1], big) == kind {
+            start -= 1;
+        }
+        let mut end = col;
+        while end + 1 < chars.len() && class(chars[end + 1], big) == kind {
+            end += 1;
+        }
+        // `aw` takes the trailing blanks too, falling back to the leading ones
+        // at the end of a line — which is how `daw` on the last word of a line
+        // doesn't leave a dangling space behind.
+        if around {
+            let was = end;
+            while end + 1 < chars.len() && class(chars[end + 1], big) == 0 {
+                end += 1;
+            }
+            if end == was {
+                while start > 0 && class(chars[start - 1], big) == 0 {
+                    start -= 1;
+                }
+            }
+        }
+        Some((
+            Cursor {
+                line: at.line,
+                col: start,
+            },
+            Cursor {
+                line: at.line,
+                col: end,
+            },
+        ))
+    }
+
+    /// `i"` / `a"` and friends, on the cursor's line.
+    #[must_use]
+    pub fn quoted_object(&self, at: Cursor, quote: char, around: bool) -> Option<(Cursor, Cursor)> {
+        let chars: Vec<char> = self.lines.get(at.line)?.chars().collect();
+        // Quotes have no nesting to track, so the pair the cursor is inside is
+        // found by counting them from the start of the line.
+        let positions: Vec<usize> = chars
+            .iter()
+            .enumerate()
+            .filter(|(_, ch)| **ch == quote)
+            .map(|(i, _)| i)
+            .collect();
+        if positions.len() < 2 {
+            return None;
+        }
+        // The pair the cursor is inside, or — as vim does — the next one along
+        // the line, so `ci"` works from the start of the line rather than only
+        // from between the quotes.
+        let (open, close) = positions
+            .chunks(2)
+            .filter(|pair| pair.len() == 2)
+            .map(|pair| (pair[0], pair[1]))
+            .find(|(open, close)| at.col <= *close && at.col >= *open)
+            .or_else(|| {
+                positions
+                    .chunks(2)
+                    .filter(|pair| pair.len() == 2)
+                    .map(|pair| (pair[0], pair[1]))
+                    .find(|(open, _)| *open >= at.col)
+            })?;
+
+        let (start, end) = if around {
+            (open, close)
+        } else {
+            if close == open + 1 {
+                return None;
+            }
+            (open + 1, close - 1)
+        };
+        Some((
+            Cursor {
+                line: at.line,
+                col: start,
+            },
+            Cursor {
+                line: at.line,
+                col: end,
+            },
+        ))
+    }
+
+    /// `i(` / `a(` and friends, counting nesting so an inner pair wins.
+    #[must_use]
+    pub fn bracket_object(
+        &self,
+        at: Cursor,
+        open: char,
+        close: char,
+        around: bool,
+    ) -> Option<(Cursor, Cursor)> {
+        let chars: Vec<char> = self.lines.get(at.line)?.chars().collect();
+
+        // Outwards from the cursor in both directions, so a cursor inside
+        // `f(g(x))` takes the pair it is actually in.
+        let mut depth = 0i32;
+        let mut start = None;
+        for i in (0..=at.col.min(chars.len().saturating_sub(1))).rev() {
+            if chars[i] == close && i != at.col {
+                depth += 1;
+            } else if chars[i] == open {
+                if depth == 0 {
+                    start = Some(i);
+                    break;
+                }
+                depth -= 1;
+            }
+        }
+        let start = start?;
+
+        depth = 0;
+        let mut end = None;
+        for (i, ch) in chars.iter().enumerate().skip(start + 1) {
+            if *ch == open {
+                depth += 1;
+            } else if *ch == close {
+                if depth == 0 {
+                    end = Some(i);
+                    break;
+                }
+                depth -= 1;
+            }
+        }
+        let end = end?;
+
+        let (start, end) = if around {
+            (start, end)
+        } else {
+            if end == start + 1 {
+                return None;
+            }
+            (start + 1, end - 1)
+        };
+        Some((
+            Cursor {
+                line: at.line,
+                col: start,
+            },
+            Cursor {
+                line: at.line,
+                col: end,
+            },
+        ))
+    }
+
+    // ---- range operations ------------------------------------------------
+
+    /// Removes the text between two positions and returns it.
+    ///
+    /// `end` is exclusive, matching how a selection is held; callers wanting
+    /// vim's inclusive motions add the character themselves.
+    pub fn delete_range(&mut self, start: Cursor, end: Cursor) -> String {
+        if start >= end {
+            return String::new();
+        }
+        let text = self.slice(start, end);
+        self.push_undo(EditKind::Delete);
+        self.cursor = start;
+        self.selection_anchor = Some(end);
+        self.delete_selection_inner();
+        text
+    }
+
+    /// The same range, left where it is.
+    #[must_use]
+    pub fn copy_range(&self, start: Cursor, end: Cursor) -> String {
+        if start >= end {
+            return String::new();
+        }
+        self.slice(start, end)
+    }
+
+    /// `J`: pulls the following line up onto this one.
+    ///
+    /// Vim leaves exactly one space at the join and none before a closing
+    /// bracket, which is the difference between joining prose and mangling it.
+    pub fn join_lines(&mut self, count: usize) {
+        let joins = count.max(2) - 1;
+        self.push_undo(EditKind::Structural);
+        for _ in 0..joins {
+            if self.cursor.line + 1 >= self.lines.len() {
+                break;
+            }
+            let next = self.lines.remove(self.cursor.line + 1);
+            let trimmed = next.trim_start();
+            let current = self.lines[self.cursor.line].trim_end().to_string();
+            let separator = if current.is_empty() || trimmed.is_empty() || trimmed.starts_with(')')
+            {
+                ""
+            } else {
+                " "
+            };
+            self.cursor.col = current.chars().count();
+            self.lines[self.cursor.line] = format!("{current}{separator}{trimmed}");
+        }
+        self.desired_col = None;
+        self.touch();
+    }
+
+    /// `~`: flips the case of the characters under the cursor and moves past.
+    pub fn toggle_case(&mut self, count: usize) {
+        let len = self.line_len(self.cursor.line);
+        if self.cursor.col >= len {
+            return;
+        }
+        self.push_undo(EditKind::Structural);
+        let end = (self.cursor.col + count.max(1)).min(len);
+        let flipped: String = self.lines[self.cursor.line]
+            .chars()
+            .enumerate()
+            .map(|(i, ch)| {
+                if i < self.cursor.col || i >= end {
+                    ch
+                } else if ch.is_uppercase() {
+                    ch.to_lowercase().next().unwrap_or(ch)
+                } else {
+                    ch.to_uppercase().next().unwrap_or(ch)
+                }
+            })
+            .collect();
+        self.lines[self.cursor.line] = flipped;
+        self.cursor.col = end.min(len.saturating_sub(1));
+        self.desired_col = None;
+        self.touch();
+    }
+
+    /// `Ctrl+A` and `Ctrl+X`: adds to the number at or after the cursor.
+    ///
+    /// Returns whether there was one. Handles a leading `-`, so decrementing
+    /// past zero goes negative rather than mangling the digits.
+    pub fn adjust_number(&mut self, delta: i64) -> bool {
+        let chars: Vec<char> = self.lines[self.cursor.line].chars().collect();
+        // The number under the cursor, else the next one along the line.
+        let Some(digit) = (self.cursor.col..chars.len())
+            .find(|&i| chars[i].is_ascii_digit())
+            .or_else(|| {
+                (0..chars.len())
+                    .find(|&i| chars[i].is_ascii_digit())
+                    .filter(|&i| i >= self.cursor.col)
+            })
+        else {
+            return false;
+        };
+
+        let mut start = digit;
+        while start > 0 && chars[start - 1].is_ascii_digit() {
+            start -= 1;
+        }
+        let mut end = digit;
+        while end + 1 < chars.len() && chars[end + 1].is_ascii_digit() {
+            end += 1;
+        }
+        let negative = start > 0 && chars[start - 1] == '-';
+        let text: String = chars[start..=end].iter().collect();
+        let Ok(value) = text.parse::<i64>() else {
+            return false;
+        };
+
+        self.push_undo(EditKind::Structural);
+        let from = if negative { start - 1 } else { start };
+        let updated = if negative { -value } else { value } + delta;
+        let head: String = chars[..from].iter().collect();
+        let tail: String = chars[end + 1..].iter().collect();
+        let body = updated.to_string();
+        self.cursor.col = head.chars().count() + body.chars().count() - 1;
+        self.lines[self.cursor.line] = format!("{head}{body}{tail}");
+        self.desired_col = None;
+        self.touch();
         true
     }
 
@@ -1079,16 +1980,6 @@ fn split_lines(text: &str) -> Vec<String> {
         lines.push(String::new());
     }
     lines
-}
-
-#[cfg(test)]
-impl Editor {
-    /// Test helper: move the cursor while extending the selection.
-    fn goto_extend(&mut self, line: usize, col: usize) {
-        let anchor = self.selection_anchor;
-        self.goto(line, col);
-        self.selection_anchor = anchor;
-    }
 }
 
 #[cfg(test)]

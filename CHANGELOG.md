@@ -4,6 +4,98 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and versions follow
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.0] — 2026-08-10
+
+A minor rather than a patch release: vim mode is a new way to use the editor,
+and the keyboard behaves differently while it is on. Nothing changes for anyone
+who leaves it off, and a `config.toml` written by an earlier version still
+loads — the new key has a default.
+
+### Added
+
+- **`F3` closes the tab**, in vim mode and out. `Ctrl+W` still does it with vim
+  off, but vim spends that key on the window prefix, and every plain
+  `Ctrl`+letter is already taken by the app, by vim, or by the terminal itself.
+  `Ctrl+Shift+W` is not the answer either: without the Kitty protocol the Shift
+  cannot be encoded, so it arrives as `Ctrl+W`, arms the prefix and swallows the
+  next keystroke. F-keys are unambiguous everywhere, which is why `F4` carries
+  the vim toggle too.
+
+- **Vim mode in the note editor, on `F4`.** Normal, Insert, Visual and
+  Visual-Line.
+
+  Motions `h j k l`, `gj`/`gk`, `w W b B e E ge`, `0 ^ $`, `gg G`, `{ }`, and
+  `f F t T` with `;`/`,` to repeat. `j` and `k` move by source line as they do
+  in vim; `gj`/`gk` move by the row on screen.
+
+  Operators `d c y > <` over any motion, or doubled for the line — `dd`, `cc`,
+  `yy`, `>>`, `<<` — with counts anywhere they are accepted in vim, so `d3w`
+  and `3dw` agree. Text objects `iw aw`, `i" a"`, `i( a(`, `i[ a[`, `i{ a{`,
+  with nesting counted so an inner pair wins.
+
+  Single keys `i I a A o O`, `x X s S`, `D C Y`, `p P`, `r`, `J`, `~`, `u`,
+  `Ctrl+R`, and `Ctrl+A`/`Ctrl+X` to increment and decrement.
+
+  One resolver defines every motion, and both operators and visual-mode
+  movement go through it, so `dw` and `w` cannot disagree about where a word
+  ends. Vim's exclusive/inclusive distinction is modelled rather than
+  approximated: `dw` stops before the next word and `de` takes the last letter
+  of this one.
+
+  Outside Insert mode the Ctrl keys vim defines take vim's meanings rather than
+  the app's: `Ctrl+R` redoes, `Ctrl+D`/`Ctrl+U` and `Ctrl+F`/`Ctrl+B` scroll,
+  `Ctrl+A`/`Ctrl+X` adjust a number, and `Ctrl+O`/`Ctrl+I` walk the note
+  history. In Insert mode only `Ctrl+W` and `Ctrl+U` are claimed, for vim's
+  word- and line-delete. Everything else is unchanged there, in every other
+  pane, and with vim mode off; shifted combinations are left alone, so
+  `Ctrl+Shift+F` still searches.
+
+  The app's commands move onto a `Space` leader and its panes onto `Ctrl+W`.
+  Pressing `Space` draws a which-key menu built from the same table that binds
+  the keys, so a binding cannot exist without being listed. `Ctrl+W h/j/k/l`
+  moves between the explorer, note and sidebar, `[b`/`]b` step through tabs.
+
+  Vim mode applies to the editor and not to reading: a note being read has no
+  buffer to act on, so the reading pane keeps every key it always had and
+  `Ctrl+E` is still the way in. The two navigation keys are the exception,
+  because moving between panes and notes is not editing.
+
+  A `:` line, typed along the bottom row rather than in a dialog: `:w` `:wq`
+  `:x` `:q` `:q!` `:qa` `:e <name>` `:42` `:h`, plus `:set` for the handful of
+  options worth changing mid-session and `:mkconfig` to write them down. Most
+  are an existing action under a different name, so `:w` and `Ctrl+S` are not
+  two implementations of saving.
+
+  In-buffer search on `/` and `?`, with `n`/`N` to step and `:noh` to clear.
+  A plain substring rather than a regular expression — notes are prose, and a
+  half-supported regex dialect would be worse than an honest literal one — and
+  case-insensitive until the pattern contains a capital, which is vim's
+  `smartcase`. Every match on screen is highlighted, not only the one jumped to.
+
+  `.` repeats the last change, including the text typed during it. It replays
+  the keys rather than a parsed command, which is the one representation that
+  covers an operator with a motion, a lone `x`, and an insert uniformly.
+
+  Deliberately hard to get stuck in: the mode is named in the status bar, the
+  cursor is a block in Normal and a bar in Insert, a pending `2d` is shown as
+  it is typed, the hint bar leads with the way out, and the reference opens by
+  itself the first time it is ever switched on. `F4` works from anywhere,
+  including from inside Normal mode and over an open overlay.
+
+  Off by default, and with it off the editor behaves exactly as it did before.
+
+- `editor.vim` in `config.toml`, also reachable as `/vim on|off` and from the
+  command palette. It is the one setting written the moment it changes rather
+  than when settings are saved, because it decides what every key does and
+  silently losing it on the next launch is a different order of problem.
+
+- `Config::save_to`, mirroring `State::save_to`, so tests that write settings
+  do not reach into the config directory of the machine running them.
+
+- Forward navigation. `Action::Back` now records what it stepped away from, so
+  there is something to return to; opening a note any other way clears the
+  trail, as a browser does. Reachable as `Ctrl+I` in vim mode.
+
 ## [0.4.2] — 2026-08-07
 
 Nothing in the app changed. This release exists to carry the packaging work,
@@ -457,6 +549,7 @@ First release.
 - Unreadable vaults are reported clearly, including the macOS privacy
   permission that usually causes it.
 
+[0.5.0]: https://github.com/iamrohithrnair/emeraldian/releases/tag/v0.5.0
 [0.4.2]: https://github.com/iamrohithrnair/emeraldian/releases/tag/v0.4.2
 [0.4.1]: https://github.com/iamrohithrnair/emeraldian/releases/tag/v0.4.1
 [0.4.0]: https://github.com/iamrohithrnair/emeraldian/releases/tag/v0.4.0

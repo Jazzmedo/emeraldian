@@ -136,6 +136,7 @@ doesn't. `?` shows the full list in the app.
 | `Tab` | Move between panes |
 | `hjkl`, `g`, `G` | Move within a pane |
 | `Enter` | Open / follow a link |
+| `F3` / `F4` | Close the tab / vim mode on / off |
 
 In the editor: `↑`/`↓`, `Home` and `End` follow the rows on screen, so a wrapped
 paragraph moves through a line at a time as it looks rather than as it is stored.
@@ -156,6 +157,95 @@ or a search field it types a `q`, and `Ctrl+Q` is the way out.
 
 A context-sensitive hint bar sits above the status bar showing the keys that
 apply where you are; `Ctrl+P` → "Toggle shortcut hints" turns it off.
+
+## Vim mode
+
+`F4` switches the editor between **emeraldian mode** — the default, described
+above — and **vim mode**. It works from anywhere, including from inside vim's
+own Normal mode, so it is always the way back out. `/vim on`, `:set vim` and
+`Ctrl+P` → "Toggle vim mode" do the same thing.
+
+Unlike every other setting, this one is written to `config.toml` the moment you
+change it. It decides what every key on the keyboard does, and having that
+quietly reset on the next launch would be a poor trade for consistency.
+
+```
+modes     Normal · Insert · Visual · V-Line, named in the status bar
+motions   h j k l   gj gk   w W b B e E ge   0 ^ $   gg G   { }
+          f F t T  and  ; ,  to repeat the last one
+counts    3j  2dd  d3w  5x
+operators d c y > <   over any motion, or doubled for the line: dd cc yy >> <<
+objects   iw aw  i" a"  i( a( ib ab  i[ a[  i{ a{ iB aB
+edits     i I a A o O   x X s S   D C Y   r   J   ~   u   Ctrl+R
+numbers   Ctrl+A / Ctrl+X to increment and decrement
+visual    v  V  then  d  y  c  >  <
+scroll    Ctrl+D / Ctrl+U   Ctrl+F / Ctrl+B
+```
+
+`j` and `k` move by source line, as they do in vim, so one press crosses a
+wrapped paragraph; `gj` and `gk` move by the row on screen, which is what the
+arrow keys do in both modes. The cursor is drawn as a block in Normal mode and a
+bar in Insert, on terminals that support it.
+
+Outside Insert mode, the Ctrl keys vim defines take vim's meanings rather than
+the app's: `Ctrl+R` redoes, `Ctrl+D`/`Ctrl+U` and `Ctrl+F`/`Ctrl+B` scroll,
+`Ctrl+A`/`Ctrl+X` adjust a number, and `Ctrl+O`/`Ctrl+I` walk back and forward
+through the notes you've visited. They keep their usual meanings in Insert mode,
+in every other pane, and whenever vim mode is off. Shifted combinations are left
+alone, so `Ctrl+Shift+F` still searches the vault.
+
+`Esc` in Insert returns to Normal, and `Esc` again leaves for the reading view,
+which is where one press used to take you.
+
+The app's own commands move onto a `Space` leader, and its panes onto `Ctrl+W` —
+the two things an nvim user's hands already expect:
+
+```
+Ctrl+W h/j/k/l   explorer / note / sidebar      Ctrl+W w  cycle
+Ctrl+W c   /  F3  close the tab (Ctrl+W alone is the prefix now)
+[b  ]b           previous / next tab
+
+Space ff  find a note      Space e  explorer     Space g  graph
+Space fg  grep the vault   Space p  palette      Space G  local graph
+Space n   new note         Space w  save         Space a  assistant
+Space d   daily note       Space x  close tab    Space o  outline
+Space t   theme            Space r  reload       Space ?  help
+```
+
+Pressing `Space` draws that menu on screen and the next key picks from it, so
+none of it has to be memorised. `Ctrl+W` is claimed by some terminals and
+multiplexers before the app sees it; `Tab` still cycles panes if so.
+
+**Vim mode applies to the editor, not to reading.** A note you are reading has
+no buffer to act on, so the reading pane keeps every key it always had — `j`/`k`
+to scroll, `g`/`G` for top and bottom — and `Ctrl+E` is still the way in. Only
+the two navigation keys above, `Ctrl+W` and `Ctrl+O`/`Ctrl+I`, reach outside the
+editor, because moving between panes and notes is not editing.
+
+`:` and `/` type along the bottom row, where every editor this is imitating puts
+them:
+
+```
+:w  :wq  :x       save, and close the tab      :q   :q!   close the tab
+:qa :qa!          quit the app                 :42        jump to a line
+:e <name>         open a note, creating it     :e         reload the vault
+:set nu           nonu wrap nowrap et noet ts=4 novim
+:mkconfig         write the current settings to config.toml
+/pattern  ?pattern    search; n and N step, :noh clears the highlight
+.                     repeat the last change, including the text typed
+```
+
+Search is a plain substring rather than a regular expression, and ignores case
+unless the pattern contains a capital — vim's `smartcase`. Every match on screen
+is highlighted, not just the one jumped to.
+
+`:q` closes the note, the way it closes a window in vim; `:qa` quits the app.
+
+With vim mode off, every key in this README behaves exactly as it always has.
+
+One thing worth knowing: `editor.auto_save` is on by default, so a note mangled
+by a mistyped command is written to disk when you switch tabs or close it. `u`
+undoes as far back as you like while the tab is open.
 
 ## Mouse
 
@@ -372,6 +462,14 @@ the config — not in it, since it isn't something you'd type by hand. Set
 `OTUI_STATE_FILE` to keep it somewhere else, or delete it to start with every
 folder collapsed again.
 
+Vim mode lives under `[editor]`, and is the one key written as soon as it is
+toggled rather than when settings are saved:
+
+```toml
+[editor]
+vim = false               # F4, /vim on, or :set vim
+```
+
 Pictures can be turned off, and capped, under `[images]`:
 
 ```toml
@@ -414,7 +512,7 @@ same state.
 ## Development
 
 ```sh
-cargo test --workspace          # 542 tests
+cargo test --workspace          # 722 tests
 cargo clippy --workspace --all-targets
 cargo fmt --all --check
 ```

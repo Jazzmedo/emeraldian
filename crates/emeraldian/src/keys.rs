@@ -27,9 +27,48 @@ pub fn handle(app: &mut App, key: KeyEvent) {
     // A message from the last action is stale as soon as the user acts again.
     app.status.text.clear();
 
+    // The vim toggle outranks even an overlay. Turning vim on opens its
+    // reference the first time, and if that overlay then swallowed F4 the way
+    // out would stop working at exactly the moment a new user goes looking for
+    // it. Dispatching closes the overlay on the way past.
+    if key.code == KeyCode::F(4) {
+        dispatch(app, Action::ToggleVimMode);
+        return;
+    }
+
     if app.modal.is_some() {
         handle_modal(app, key);
         return;
+    }
+
+    // Vim comes in two layers, and keeping them apart is what stops each from
+    // leaking into the other's territory.
+    //
+    // The first is navigation — moving between panes and through the notes
+    // you have visited. That is about the application, not about text, so it
+    // works from every pane. Confining it to the editor made `Ctrl+W` a trap:
+    // it would take you to the explorer and then, pressed again to come back,
+    // close your tab instead.
+    //
+    // The second is text editing — the modes, motions and operators. That is
+    // only meaningful on a buffer you are editing, so it engages nowhere else.
+    // Letting it reach a note being *read* gave a phantom `INSERT` on a note
+    // that wasn't open, and quietly took `Ctrl+D` away from the daily note.
+    //
+    // Both layers get first refusal ahead of the global map, and both return
+    // whether they used the key. Anything declined falls through below and
+    // keeps the meaning it always had — there is no list of exceptions to keep
+    // in step with the handlers.
+    // The graph has its own keys and its own way out; neither layer applies
+    // there.
+    if app.config.editor.vim && app.view == View::Notes {
+        let key = normalize_legacy_ctrl(key);
+        if !crate::vim::is_typing(app) && crate::vim::navigation(app, key) {
+            return;
+        }
+        if app.focus == Focus::Note && app.editing() && crate::vim::handle(app, key) {
+            return;
+        }
     }
 
     if handle_global(app, key) {
@@ -95,6 +134,18 @@ fn handle_global(app: &mut App, key: KeyEvent) -> bool {
         (true, true, KeyCode::Tab | KeyCode::BackTab) => Some(Action::PreviousTab),
         (true, false, KeyCode::Tab) => Some(Action::NextTab),
         (_, _, KeyCode::F(2)) => Some(Action::RenameNote),
+        // Closing a tab needs a key that means the same thing in both modes.
+        // `Ctrl+W` cannot: vim spends it on the window prefix, and every plain
+        // `Ctrl`+letter is already taken by the app, by vim, or by the terminal
+        // itself. `Ctrl+Shift+W` looks like the answer and is not — without the
+        // Kitty protocol the Shift is unencodable, so it arrives as `Ctrl+W`,
+        // arms the prefix and eats the next keystroke. F-keys are unambiguous
+        // everywhere, which is the same reason `F4` carries the vim toggle.
+        (_, _, KeyCode::F(3)) => Some(Action::CloseTab),
+        // Matched here, ahead of everything vim claims, because it has to work
+        // from inside Normal mode too — a toggle that can be switched on but
+        // not off is a trap. F-keys are the only ones vim leaves alone.
+        (_, _, KeyCode::F(4)) => Some(Action::ToggleVimMode),
         _ => None,
     };
 
@@ -127,7 +178,7 @@ fn handle_global(app: &mut App, key: KeyEvent) -> bool {
     false
 }
 
-fn cycle_focus(app: &mut App, delta: isize) {
+pub fn cycle_focus(app: &mut App, delta: isize) {
     let mut order = vec![Focus::Explorer];
     order.push(if app.view == View::Graph {
         Focus::Graph

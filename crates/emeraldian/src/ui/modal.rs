@@ -13,14 +13,20 @@ use crate::modal::{Confirm, Modal, Picker, Prompt};
 use crate::ui::{centered, pane_block, scrollbar, truncate};
 
 pub fn draw(frame: &mut Frame, app: &mut App, palette: &Palette, area: Rect) {
+    // Read before the modal is borrowed mutably below.
+    let vim = app.config.editor.vim;
     let Some(modal) = app.modal.as_mut() else {
         return;
     };
     match modal {
         Modal::Picker(picker) => draw_picker(frame, picker, palette, area),
+        // The vim command and search lines are drawn on the status row by
+        // `ui::draw`, where every editor puts them; a dialog in the middle of
+        // the screen for `:w` would be jarring.
+        Modal::Prompt(prompt) if is_command_line(prompt) => {}
         Modal::Prompt(prompt) => draw_prompt(frame, prompt, palette, area),
         Modal::Confirm(confirm) => draw_confirm(frame, confirm, palette, area),
-        Modal::Help(scroll) => draw_help(frame, scroll, palette, area),
+        Modal::Help(scroll) => draw_help(frame, scroll, palette, area, vim),
     }
 }
 
@@ -243,7 +249,10 @@ const HELP: &[(&str, &[(&str, &str)])] = &[
             ("Ctrl+S", "Save"),
             ("Ctrl+D", "Today's daily note"),
             ("F2", "Rename the open note"),
-            ("Ctrl+W", "Close the tab"),
+            (
+                "F3 / Ctrl+W",
+                "Close the tab — Ctrl+W unless vim mode is on",
+            ),
             ("Ctrl+Tab", "Next tab"),
             ("Ctrl+B / Ctrl+I", "Bold / italic (while editing)"),
             ("Ctrl+Z / Ctrl+Y", "Undo / redo"),
@@ -268,6 +277,60 @@ const HELP: &[(&str, &[(&str, &str)])] = &[
             ("Ctrl+Shift+K", "Delete the line"),
             ("Ctrl+←/→", "By word"),
             ("Ctrl+Home / End", "Start and end of the note"),
+        ],
+    ),
+    (
+        "Vim mode",
+        &[
+            ("F4", "Turn vim mode on and off — saved straight away"),
+            ("i / a / o", "Insert before, after, or on a new line"),
+            ("Esc", "Back to Normal mode; again to stop editing"),
+            (
+                "h j k l",
+                "Left, down, up, right — j/k by line, gj/gk by row",
+            ),
+            ("w / b / e", "Forwards, back, and to the end of a word"),
+            ("0 / ^ / $", "Start of line / first word / end of line"),
+            ("gg / G", "Top / bottom of the note"),
+            ("{ / }", "Previous / next paragraph"),
+            ("f / t", "To a character on this line; ; and , repeat it"),
+            ("d c y > <", "Delete, change, yank, indent — over a motion"),
+            ("dd cc yy", "The doubled form acts on the whole line"),
+            ("diw ci\" da(", "Act on a word, a quoted string, a bracket"),
+            ("v / V", "Select by character / by line"),
+            ("x / X / s", "Delete forwards, backwards, or and type"),
+            ("D / C / Y", "Delete, change or yank to the end of the line"),
+            ("p / P", "Put after / before"),
+            ("r / J / ~", "Replace a character, join lines, flip case"),
+            ("u / Ctrl+R", "Undo / redo"),
+            ("3dd, d3w", "A count repeats what follows it"),
+            ("Ctrl+A / Ctrl+X", "Increment / decrement the number here"),
+            ("Ctrl+D / Ctrl+U", "Half a page down / up"),
+            ("Ctrl+F / Ctrl+B", "A page down / up"),
+        ],
+    ),
+    (
+        "Vim mode: getting around",
+        &[
+            ("Space", "The leader menu — every app command, listed"),
+            ("Ctrl+W h/j/k/l", "Move to the explorer, note, or sidebar"),
+            ("Ctrl+W w / c", "Cycle panes / close the tab"),
+            ("[b / ]b", "Previous / next tab"),
+            ("Ctrl+O / Ctrl+I", "Back and forward through visited notes"),
+        ],
+    ),
+    (
+        "Vim mode: the : and / lines",
+        &[
+            (":w :wq :q", "Save, save and close, close the tab"),
+            (":qa / :qa!", "Quit, asking first or not"),
+            (":e <name>", "Open a note, creating it if it's missing"),
+            (":42", "Jump to a line number"),
+            (":set nu", "nonu, wrap, nowrap, et, noet, ts=4, novim"),
+            (":mkconfig", "Write the current settings to config.toml"),
+            ("/ and ?", "Search the note forwards or backwards"),
+            ("n / N", "Next and previous match; :noh clears it"),
+            (".", "Repeat the last change, including what was typed"),
         ],
     ),
     (
@@ -326,7 +389,83 @@ const HELP: &[(&str, &[(&str, &str)])] = &[
     ),
 ];
 
-fn draw_help(frame: &mut Frame, scroll: &mut usize, palette: &Palette, area: Rect) {
+/// Whether a prompt is one of vim's bottom-row lines.
+#[must_use]
+pub fn is_command_line(prompt: &Prompt) -> bool {
+    matches!(
+        prompt.intent,
+        crate::modal::PromptIntent::VimEx | crate::modal::PromptIntent::VimSearch(_)
+    )
+}
+
+/// Draws `:` or `/` along the status row, with the caret in it.
+pub fn draw_command_line(frame: &mut Frame, prompt: &Prompt, palette: &Palette, area: Rect) {
+    let text = format!("{}{}", prompt.title, prompt.value);
+    Paragraph::new(Line::from(Span::styled(
+        text,
+        Style::default().fg(palette.text_normal),
+    )))
+    .style(Style::default().bg(palette.bg_primary))
+    .render(area, frame.buffer_mut());
+
+    let column = prompt.title.chars().count() + prompt.cursor;
+    frame.set_cursor_position((area.x + u16::try_from(column).unwrap_or(u16::MAX), area.y));
+}
+
+/// The leader menu, drawn while `<Space>` is waiting for its second key.
+///
+/// A remapped keyboard is only safe if the map is on screen. Rather than vim's
+/// timeout — which means guessing how long a person needs to think — this
+/// appears at once and the next key dismisses it, so it costs nothing to see
+/// and nothing to ignore.
+pub fn draw_leader(frame: &mut Frame, palette: &Palette, area: Rect) {
+    use crate::vim::LEADER;
+
+    // Two columns of bindings, plus a border and a title.
+    let rows = LEADER.len().div_ceil(2);
+    let height = u16::try_from(rows + 2).unwrap_or(12).min(area.height);
+    let width = 52.min(area.width);
+    let rect = centered(area, width, height);
+
+    frame.render_widget(Clear, rect);
+    let block = pane_block("Leader — Space", true, palette, palette.bg_secondary);
+    let inner = block.inner(rect);
+    frame.render_widget(block, rect);
+
+    // Two columns, each a fixed-width key followed by what it does.
+    let column = usize::from(inner.width) / 2;
+    let label_width = column.saturating_sub(6);
+    let lines: Vec<Line> = LEADER
+        .chunks(2)
+        .map(|pair| {
+            let mut spans = Vec::new();
+            for (keys, label, _) in pair {
+                spans.push(Span::styled(
+                    format!(" {keys:<3} "),
+                    Style::default()
+                        .fg(palette.text_accent)
+                        .add_modifier(Modifier::BOLD),
+                ));
+                spans.push(Span::styled(
+                    format!("{:<label_width$}", truncate(label, label_width)),
+                    Style::default().fg(palette.text_muted),
+                ));
+            }
+            Line::from(spans)
+        })
+        .collect();
+
+    Paragraph::new(lines).render(inner, frame.buffer_mut());
+}
+
+/// The section that only applies once vim mode is switched on.
+///
+/// Hidden until then, so `?` reads exactly as it always has for the people who
+/// never turn it on — a page of keys that don't work is worse than no page.
+/// Prefix marking the sections that only apply once vim mode is on.
+const VIM_SECTION: &str = "Vim mode";
+
+fn draw_help(frame: &mut Frame, scroll: &mut usize, palette: &Palette, area: Rect, vim: bool) {
     let rect = centered(
         area,
         72.min(area.width),
@@ -340,6 +479,9 @@ fn draw_help(frame: &mut Frame, scroll: &mut usize, palette: &Palette, area: Rec
 
     let mut lines = Vec::new();
     for (section, bindings) in HELP {
+        if section.starts_with(VIM_SECTION) && !vim {
+            continue;
+        }
         lines.push(Line::from(Span::styled(
             (*section).to_string(),
             Style::default()
@@ -388,6 +530,29 @@ mod tests {
                 assert!(!key.is_empty() && !description.is_empty());
             }
         }
+    }
+
+    #[test]
+    fn the_help_names_both_ways_to_close_a_tab() {
+        // `F3` works in both modes and `Ctrl+W` only outside vim, so the help
+        // has to say which is which — the hint bar has room for one key, and
+        // this is where the rest of the truth goes.
+        let entry = HELP
+            .iter()
+            .flat_map(|(_, bindings)| bindings.iter())
+            .find(|(_, description)| description.starts_with("Close the tab"))
+            .expect("the help documents closing a tab");
+
+        assert!(
+            entry.0.contains("F3"),
+            "the key that always works comes first"
+        );
+        assert!(entry.0.contains("Ctrl+W"), "and the familiar one is named");
+        assert!(
+            entry.1.contains("vim"),
+            "with the condition attached: {:?}",
+            entry.1
+        );
     }
 
     #[test]

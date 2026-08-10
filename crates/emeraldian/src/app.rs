@@ -234,6 +234,10 @@ pub enum Action {
     FollowLink(String),
     RevealInExplorer,
     Back,
+    /// Undoes a `Back`. Vim's `Ctrl+I`, against the note history.
+    Forward,
+    /// Moves keyboard focus to a named pane. `Ctrl+W h` and friends.
+    FocusPane(Focus),
 
     // Notes
     NewNote,
@@ -259,6 +263,8 @@ pub enum Action {
     ToggleHints,
     /// Steps the explorer through the sort orders and remembers the choice.
     CycleSortOrder,
+    /// Switches between emeraldian mode and vim mode, and writes the config.
+    ToggleVimMode,
     CycleSidePanel,
     OpenGraph,
     OpenLocalGraph,
@@ -346,6 +352,12 @@ pub struct App {
     pub active_tab: Option<usize>,
     /// Recently visited notes, newest last — powers `Back`.
     pub history: Vec<NoteId>,
+    /// Notes stepped back *from*, newest last — powers `Forward`.
+    ///
+    /// The browser rule: `Back` fills this, and opening a note any other way
+    /// clears it, because once you have gone somewhere new there is no longer a
+    /// forward to return to.
+    pub forward: Vec<NoteId>,
 
     pub view: View,
     pub focus: Focus,
@@ -370,6 +382,21 @@ pub struct App {
     pub images: crate::images::Images,
     /// The Excalidraw scene currently on screen, kept parsed between frames.
     pub scenes: crate::ui::drawing::Scenes,
+    /// Modal-editing state. Inert unless `config.editor.vim` is on.
+    ///
+    /// One per app rather than one per tab: only one editor has focus at a
+    /// time, and a register shared across tabs is what vim does — yanking in
+    /// one note and putting it in another is the whole point.
+    pub vim: crate::vim::Vim,
+    /// Where `config.toml` and `state.json` are written, when it isn't the
+    /// real config directory.
+    ///
+    /// `None` everywhere but in tests. Toggling vim mode writes the config
+    /// immediately, so without a seam every test that presses `F4` would edit
+    /// the settings of whoever ran it — the same hazard `OTUI_STATE_FILE`
+    /// exists for, expressed as a field because the crate forbids the `unsafe`
+    /// that setting an environment variable now needs.
+    pub config_dir: Option<PathBuf>,
     pub quit: bool,
 }
 
@@ -401,6 +428,7 @@ impl App {
             tabs: Vec::new(),
             active_tab: None,
             history: Vec::new(),
+            forward: Vec::new(),
             view: View::Notes,
             focus: Focus::Explorer,
             side_panel: SidePanel::Outline,
@@ -414,6 +442,8 @@ impl App {
             status: Status::default(),
             images: crate::images::Images::disabled(),
             scenes: crate::ui::drawing::Scenes::default(),
+            vim: crate::vim::Vim::default(),
+            config_dir: None,
             quit: false,
             theme: ActiveTheme::new(theme),
             themes,
@@ -429,6 +459,30 @@ impl App {
         app.explorer.collapse_all(&app.index);
         app.explorer.rebuild(&app.index);
         Ok(app)
+    }
+
+    /// Writes the settings, wherever this app has been told to keep them.
+    pub fn save_config(&self) -> std::io::Result<PathBuf> {
+        match &self.config_dir {
+            Some(dir) => self.config.save_to(&dir.join("config.toml")),
+            None => self.config.save(),
+        }
+    }
+
+    /// Reads the persistent UI state from wherever this app keeps it.
+    pub fn load_state(&self) -> crate::state::State {
+        match &self.config_dir {
+            Some(dir) => crate::state::State::load_from(&dir.join("state.json")),
+            None => crate::state::State::load(),
+        }
+    }
+
+    /// The counterpart write.
+    pub fn store_state(&self, state: &crate::state::State) {
+        match &self.config_dir {
+            Some(dir) => state.save_to(&dir.join("state.json")),
+            None => state.save(),
+        }
     }
 
     /// Reopens the folders left open last time this vault was used.
@@ -500,6 +554,15 @@ impl App {
         self.active().map(|t| t.note)
     }
 
+    /// Whether the open note is being edited rather than read.
+    ///
+    /// Vim's modes only exist inside the editor, so several places need to ask
+    /// this before deciding a key or a label means anything vim-related.
+    #[must_use]
+    pub fn editing(&self) -> bool {
+        self.active().is_some_and(|tab| tab.mode == Mode::Editing)
+    }
+
     #[must_use]
     pub fn note_title(&self, id: NoteId) -> String {
         self.index
@@ -513,6 +576,18 @@ impl App {
             text: message.into(),
             is_error: false,
         };
+    }
+
+    /// Reports a yank, which is otherwise completely invisible.
+    ///
+    /// `yy` changes nothing on screen, so without a word in the status bar it
+    /// is indistinguishable from a key that did nothing at all.
+    pub fn info_yank(&mut self, lines: usize) {
+        self.info(if lines == 1 {
+            "yanked 1 line".to_string()
+        } else {
+            format!("yanked {lines} lines")
+        });
     }
 
     pub fn error(&mut self, message: impl Into<String>) {
@@ -539,6 +614,9 @@ impl App {
             if self.history.len() > 100 {
                 self.history.remove(0);
             }
+            // Navigating somewhere new ends any forward trail, as it does in a
+            // browser. `Back` puts its own entry back afterwards.
+            self.forward.clear();
         }
 
         if let Some(existing) = self.tabs.iter().position(|t| t.note == id) {
@@ -561,6 +639,9 @@ impl App {
         self.view = View::Notes;
         self.focus = Focus::Note;
         self.side_selected = 0;
+        // A note opens in Normal mode, never mid-insert: arriving in a fresh
+        // note with typing already live is how you edit the wrong file.
+        self.vim.reset();
     }
 
     /// Opens a note by name or vault-relative path, creating it if missing.
@@ -612,6 +693,7 @@ impl App {
         let next = (current + delta).rem_euclid(count);
         self.active_tab = Some(next as usize);
         self.side_selected = 0;
+        self.vim.reset();
     }
 
     /// The editor for the active tab, created on first use.
