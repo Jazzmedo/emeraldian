@@ -1,4 +1,4 @@
-<img src="https://raw.githubusercontent.com/iamrohithrnair/emeraldian/main/docs/logo.png" width="84" alt="">
+<img src="https://raw.githubusercontent.com/Jazzmedo/emeraldian/dist/docs/logo.png" width="84" alt="">
 
 # Emeraldian
 
@@ -16,7 +16,15 @@ It also comes with an AI assistant that works on your notes through the very
 same commands you do, so you can watch what it did instead of taking its word
 for it.
 
-![emeraldian: walking the file tree, backlinks, the graph, an Excalidraw drawing, a picture in the reading pane, and a theme switch](https://raw.githubusercontent.com/iamrohithrnair/emeraldian/main/docs/demo.gif)
+![emeraldian: walking the file tree, backlinks, the graph, an Excalidraw drawing, a picture in the reading pane, and a theme switch](https://raw.githubusercontent.com/Jazzmedo/emeraldian/dist/docs/demo.gif)
+
+> **This is a fork.** It is [iamrohithrnair/emeraldian](https://github.com/iamrohithrnair/emeraldian)
+> plus automatic right-to-left support — Arabic, Hebrew, Persian and Urdu notes
+> read in the correct direction, in the reading pane, the editor, the sidebars
+> and the inputs. That work is offered upstream in
+> [a pull request](https://github.com/iamrohithrnair/emeraldian/pulls); these
+> builds exist so it is usable while that sits. Everything else is upstream's,
+> and the credit for it is theirs.
 
 ## Install
 
@@ -24,34 +32,27 @@ The one-liner is the easiest way in. It works out which build fits your machine,
 downloads it, and checks it against its published checksum before anything moves:
 
 ```sh
-curl -fsSL https://emeraldian-tui.github.io/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/Jazzmedo/emeraldian/dist/install.sh | sh
 ```
 
 macOS and Linux. Set `OTUI_BIN_DIR` to choose where it lands, or `OTUI_VERSION`
 to pin a release. Piping a script into a shell is always worth a look first;
-[here it is in full](https://github.com/iamrohithrnair/emeraldian/blob/main/install.sh),
+[here it is in full](https://github.com/Jazzmedo/emeraldian/blob/dist/install.sh),
 and it's a readable 150-odd lines.
 
-Or use whichever package manager you already trust.
-
-**Homebrew** (macOS and Linux):
-
-```sh
-brew install iamrohithrnair/tap/emeraldian
-```
-
-**npm** — *coming soon.* `npx emeraldian` is not published yet. The commands
-are left out rather than listed, because one that looks right and then fails is
-worse than one that is plainly missing.
-
-**Cargo** (needs Rust 1.90 or newer):
+**Cargo** (needs Rust 1.90 or newer). This is the route for **Intel Macs and
+Windows**, which the install script deliberately refuses rather than handing you
+a binary that does not fit:
 
 ```sh
-cargo install emeraldian
+cargo install --git https://github.com/Jazzmedo/emeraldian --branch dist --locked emeraldian
 ```
+
+It compiles from source, so it takes a few minutes and always tracks the branch
+rather than a release.
 
 **Manual download.** Grab an archive from the
-[latest release](https://github.com/iamrohithrnair/emeraldian/releases/latest):
+[latest release](https://github.com/Jazzmedo/emeraldian/releases/latest):
 
 ```sh
 tar -xzf emeraldian-<target>.tar.gz
@@ -67,11 +68,15 @@ Prebuilt for `aarch64-apple-darwin` (Apple silicon),
 **From a clone:**
 
 ```sh
-git clone https://github.com/iamrohithrnair/emeraldian
+git clone -b dist https://github.com/Jazzmedo/emeraldian
 cd emeraldian
 cargo install --path crates/emeraldian --locked   # installs to ~/.cargo/bin
 cargo build --release                             # or just build it
 ```
+
+Upstream's `cargo install emeraldian` and `brew install
+iamrohithrnair/tap/emeraldian` install the original, without any of the
+right-to-left work, so they are left out here on purpose.
 
 ## Run
 
@@ -560,61 +565,20 @@ Behind a corporate proxy that re-signs TLS, point cargo at your CA bundle:
 CARGO_HTTP_CAINFO="$SSL_CERT_FILE" cargo build
 ```
 
-Releases are cut by tagging. Pushing a `v*` tag builds every target, publishes
-a GitHub release with checksums, updates the Homebrew formula in the tap, and
-publishes to npm and crates.io. `CHANGELOG.md` becomes the release notes, so
-update it first.
+Releases are cut by tagging. Pushing a `v*` tag builds every target and
+publishes a GitHub release with checksums. `CHANGELOG.md` becomes the release
+notes, so update it first. Tags here are suffixed — `v0.5.0-rtl.1` — so they
+never collide with upstream's numbering, and the workspace version is
+deliberately left alone so the branch offered upstream stays exactly what they
+review.
 
-| Secret | Used for |
-|---|---|
-| `TAP_GITHUB_TOKEN` | Pushing the formula to `iamrohithrnair/homebrew-tap` |
-| `NPM_TOKEN` | Not set, and not the way forward. See below. |
-
-Without a secret the job it gates still reports success and simply does
-nothing, so a green release does not by itself mean every artefact shipped.
-Check the tap and the registry, not just the tick.
-
-npm is not published yet. npm revoked classic tokens in December 2025, and
-from January 2027 a token that bypasses 2FA cannot publish directly at all,
-so `NPM_TOKEN` is a dead end rather than a missing step. The route is OIDC
-trusted publishing, which needs no secret.
-
-crates.io uses that same model already, in `.github/workflows/crates-io.yml`:
-the runner proves which repository and workflow it is, and gets a token good
-for thirty minutes. There is no secret to store or rotate.
-
-Neither registry can bootstrap itself, and for the same reason. A trusted
-publisher is configured on a package, so the package has to exist before it can
-be set up, which means the first version of each one is published by hand:
-
-```sh
-cargo login                  # once, interactively
-cargo publish -p emeraldian-core
-cargo publish -p emeraldian-theme
-cargo publish -p emeraldian-agent
-cargo publish -p emeraldian  # last: it depends on the other three
-```
-
-Then add a trusted publisher to each crate on crates.io, pointing at this
-repository and `crates-io.yml`, and later releases publish themselves. Note
-that a published version is immutable: metadata mistakes cannot be corrected
-in place, only in the next version.
-
-To check that configuration without waiting for a release, run the workflow by
-hand with `verify_only` set:
-
-```sh
-gh workflow run crates.io -f tag=v0.4.1 -f verify_only=true
-```
-
-It authenticates and stops. A release where every crate is already published
-skips the OIDC exchange entirely, so a green release does not on its own prove
-the trusted publisher still works; renaming this file or the repository breaks
-it silently.
-
-Packaging lives in `packaging/`. The Homebrew formula is generated by
-`packaging/homebrew/update-formula.sh`, which can be run by hand against a
-directory of `.sha256` files.
+No release step needs a secret, and nothing is published to a package
+registry. crates.io, npm and a Homebrew tap all belong to upstream — the names
+are theirs and already taken — so the crates.io workflow and the Homebrew job
+are removed here rather than left to fail on every tag. The npm job is still in
+the file but inert: it has no token, and nothing to publish under. The
+one-liner in `install.sh` and `cargo install --git` are the whole distribution
+story.
 
 ```sh
 # bump the version in Cargo.toml, update CHANGELOG.md, then:

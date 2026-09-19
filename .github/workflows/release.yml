@@ -101,6 +101,11 @@ jobs:
           tag_name: ${{ github.event.inputs.tag || github.ref_name }}
           name: ${{ github.event.inputs.tag || github.ref_name }}
           body_path: CHANGELOG.md
+          # install.sh resolves "latest" through the releases/latest API,
+          # and that endpoint skips prereleases. The tags here carry an
+          # -rtl suffix, so say outright that they are not prereleases or
+          # the one-liner has nothing to find.
+          prerelease: false
           files: |
             dist/*.tar.gz
             dist/*.zip
@@ -199,66 +204,3 @@ jobs:
         run: |
           echo "::notice::NPM_TOKEN is not set, so nothing was published to npm."
           echo "Add it under Settings > Secrets and variables > Actions."
-
-  homebrew:
-    name: update the homebrew tap
-    needs: release
-    runs-on: ubuntu-latest
-    env:
-      TAP_TOKEN: ${{ secrets.TAP_GITHUB_TOKEN }}
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/download-artifact@v4
-        with:
-          path: dist
-          merge-multiple: true
-
-      - name: Rewrite the formula for this release
-        shell: bash
-        env:
-          RELEASE_TAG: ${{ github.event.inputs.tag || github.ref_name }}
-        run: ./packaging/homebrew/update-formula.sh "$RELEASE_TAG" dist
-
-      - name: Check out the tap
-        if: env.TAP_TOKEN != ''
-        uses: actions/checkout@v4
-        with:
-          repository: iamrohithrnair/homebrew-tap
-          token: ${{ secrets.TAP_GITHUB_TOKEN }}
-          path: tap
-
-      - name: Push it to the tap
-        if: env.TAP_TOKEN != ''
-        shell: bash
-        env:
-          RELEASE_TAG: ${{ github.event.inputs.tag || github.ref_name }}
-        run: |
-          set -euo pipefail
-          mkdir -p tap/Formula
-          cp packaging/homebrew/emeraldian.rb tap/Formula/emeraldian.rb
-          cd tap
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          # Stage first, then ask the index. `git diff` alone only reports
-          # tracked files, so a formula the tap has never held before reads as
-          # no change at all and is silently never committed. That is how the
-          # tap stayed empty through every release up to and including 0.4.0.
-          git add Formula/emeraldian.rb
-          if git diff --cached --quiet; then
-            echo "formula already current"
-          else
-            git commit -m "emeraldian ${RELEASE_TAG}"
-            git push
-          fi
-
-      - name: Explain a skipped tap update
-        if: env.TAP_TOKEN == ''
-        run: |
-          echo "::notice::TAP_GITHUB_TOKEN is not set, so the Homebrew tap was not updated."
-          echo "The updated formula is in this run's checkout at packaging/homebrew/."
-
-      - uses: actions/upload-artifact@v4
-        with:
-          name: homebrew-formula
-          path: packaging/homebrew/emeraldian.rb

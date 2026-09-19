@@ -1,7 +1,7 @@
 #!/bin/sh
 # Install emeraldian from a GitHub release.
 #
-#   curl -fsSL https://raw.githubusercontent.com/iamrohithrnair/emeraldian/main/install.sh | sh
+#   curl -fsSL https://raw.githubusercontent.com/Jazzmedo/emeraldian/dist/install.sh | sh
 #
 # Environment:
 #   OTUI_VERSION  version to install, e.g. v0.1.0 (default: latest)
@@ -13,7 +13,7 @@
 
 set -eu
 
-REPO="iamrohithrnair/emeraldian"
+REPO="Jazzmedo/emeraldian"
 VERSION="${OTUI_VERSION:-latest}"
 
 info() { printf '%s\n' "$*" >&2; }
